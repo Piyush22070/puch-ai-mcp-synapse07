@@ -1,5 +1,5 @@
 import asyncio
-from typing import Annotated
+from typing import Optional, Annotated
 import os
 from dotenv import load_dotenv
 from fastmcp import FastMCP
@@ -18,9 +18,14 @@ load_dotenv()
 
 TOKEN = os.environ.get("AUTH_TOKEN")
 MY_NUMBER = os.environ.get("MY_NUMBER")
+GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
+
 
 assert TOKEN is not None, "Please set AUTH_TOKEN in your .env file"
 assert MY_NUMBER is not None, "Please set MY_NUMBER in your .env file"
+assert GEMINI_API_KEY is not None, "Please set GEMINI_API_KEY in your .env file"
+assert SERPER_API_KEY is not None, "Please set SERPER_API_KEY in your .env file"
 
 # --- Auth Provider ---
 class SimpleBearerAuthProvider(BearerAuthProvider):
@@ -128,81 +133,202 @@ mcp = FastMCP(
 async def validate() -> str:
     return MY_NUMBER
 
-# --- Tool: job_finder (now smart!) ---
-JobFinderDescription = RichToolDescription(
-    description="Smart job tool: analyze descriptions, fetch URLs, or search jobs based on free text.",
-    use_when="Use this to evaluate job descriptions or search for jobs using freeform goals.",
-    side_effects="Returns insights, fetched job descriptions, or relevant job links.",
+
+# --- Tool: find_product_online (FIXED WITH ERROR HANDLING) ---
+# add the custom tool for product here
+
+# --- Tool: find_similar_products ---
+FIND_SIMILAR_PRODUCTS_DESCRIPTION = RichToolDescription(
+    description="Analyze an image to identify products and find similar items online using Serper API",
+    use_when="Use this when user sends an image of a product and wants to find similar items or shopping links",
+    side_effects="Returns product information and shopping links from various online retailers",
 )
 
-@mcp.tool(description=JobFinderDescription.model_dump_json())
-async def job_finder(
-    user_goal: Annotated[str, Field(description="The user's goal (can be a description, intent, or freeform query)")],
-    job_description: Annotated[str | None, Field(description="Full job description text, if available.")] = None,
-    job_url: Annotated[AnyUrl | None, Field(description="A URL to fetch a job description from.")] = None,
-    raw: Annotated[bool, Field(description="Return raw HTML content if True")] = False,
+@mcp.tool(description=FIND_SIMILAR_PRODUCTS_DESCRIPTION.model_dump_json())
+async def find_similar_products(
+    puch_image_data: Annotated[str, Field(description="Base64-encoded image data of the product")] = None,
+    search_query: Annotated[str | None, Field(description="Optional text description to refine search")] = None,
+    max_results: Annotated[int, Field(description="Maximum number of products to return")] = 5,
 ) -> str:
     """
-    Handles multiple job discovery methods: direct description, URL fetch, or freeform search query.
+    Analyze product image using Gemini Vision and search for similar products using Serper API
     """
-    if job_description:
-        return (
-            f"📝 **Job Description Analysis**\n\n"
-            f"---\n{job_description.strip()}\n---\n\n"
-            f"User Goal: **{user_goal}**\n\n"
-            f"💡 Suggestions:\n- Tailor your resume.\n- Evaluate skill match.\n- Consider applying if relevant."
-        )
+    print("Api Hitted!")
+    try:
+        if not puch_image_data:
+            raise McpError(ErrorData(code=INVALID_PARAMS, message="Image data is required"))
 
-    if job_url:
-        content, _ = await Fetch.fetch_url(str(job_url), Fetch.USER_AGENT, force_raw=raw)
-        return (
-            f"🔗 **Fetched Job Posting from URL**: {job_url}\n\n"
-            f"---\n{content.strip()}\n---\n\n"
-            f"User Goal: **{user_goal}**"
-        )
+        # Step 1: Analyze image with Gemini Vision
+        print("Passed Puch_image_data")
+        product_description = await analyze_product_image(puch_image_data)
+        
+        print("Gemeni Respone "+product_description)
+        
+        # Step 2: Use search query if provided, otherwise extract keywords from Gemini description
+        search_terms = search_query if search_query else extract_keywords_from_gemini(product_description)
 
-    if "look for" in user_goal.lower() or "find" in user_goal.lower():
-        links = await Fetch.google_search_links(user_goal)
-        return (
-            f"🔍 **Search Results for**: _{user_goal}_\n\n" +
-            "\n".join(f"- {link}" for link in links)
-        )
+        # Step 3: Search for products using Serper
+        products = await search_products_serper(search_terms, max_results)
+        
+        # Step 4: Format response
+        response = f"🔍 **Product Analysis Results**\n\n"
+        response += f"**Detected Product:** {product_description}\n\n"
+        
+        if search_query:
+            response += f"**Search Query Used:** {search_query}\n\n"
+        
+        response += "**Similar Products Found:**\n\n"
+        
+        for i, product in enumerate(products, 1):
+            response += f"**{i}. {product['title']}**\n"
+            response += f"   💰 Price: {product.get('price', 'N/A')}\n"
+            response += f"   🏪 Store: {product.get('source', 'N/A')}\n"
+            response += f"   🔗 Link: {product['link']}\n"
+            if product.get('rating'):
+                response += f"   ⭐ Rating: {product['rating']}\n"
+            response += "\n"
+        
+        return response
+        
+    except Exception as e:
+        raise McpError(ErrorData(code=INTERNAL_ERROR, message=f"Product search failed: {str(e)}"))
 
-    raise McpError(ErrorData(code=INVALID_PARAMS, message="Please provide either a job description, a job URL, or a search query in user_goal."))
+import re
+def extract_keywords_from_gemini(text: str) -> str:
+    """
+    Extract the 'Keywords for Online Shopping Searches' section from Gemini's response text,
+    join them into a concise, comma-separated string suitable for search query.
+    """
+    match = re.search(
+        r"Keywords for Online Shopping Searches:\n((?:\*.*\n)+)", text, re.MULTILINE
+    )
+    if match:
+        keywords_block = match.group(1)
+        keywords = [line.strip().lstrip("* ").strip() for line in keywords_block.strip().splitlines()]
+        keywords_str = ", ".join(keywords)
+        # Limit length to avoid API limits, e.g., max 200 characters
+        return keywords_str[:200]
+    else:
+        # Fallback: Use first 200 chars of full text
+        return text[:200]
 
-
-# Image inputs and sending images
-
-MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION = RichToolDescription(
-    description="Convert an image to black and white and save it.",
-    use_when="Use this tool when the user provides an image URL and requests it to be converted to black and white.",
-    side_effects="The image will be processed and saved in a black and white format.",
-)
-
-@mcp.tool(description=MAKE_IMG_BLACK_AND_WHITE_DESCRIPTION.model_dump_json())
-async def make_img_black_and_white(
-    puch_image_data: Annotated[str, Field(description="Base64-encoded image data to convert to black and white")] = None,
-) -> list[TextContent | ImageContent]:
-    import base64
-    import io
-
-    from PIL import Image
+async def analyze_product_image(image_data: str) -> str:
+    """
+    Use Gemini Vision API to analyze the product in the image.
+    """
 
     try:
-        image_bytes = base64.b64decode(puch_image_data)
-        image = Image.open(io.BytesIO(image_bytes))
+        print("Reached Gemini try")
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "contents": [
+                    {
+                        "parts": [
+                            {
+                                "text": (
+                                    "Analyze this image briefly and concisely. Provide a 3-4 sentence summary describing the product type, main color, and key features. Use keywords useful for online shopping."
+                                )
+                            },
+                            {
+                                "inline_data": {
+                                    "mime_type": "image/jpeg",
+                                    "data": image_data
+                                }
+                            }
+                        ]
+                    }
+                ]
+            }
 
-        bw_image = image.convert("L")
+            response = await client.post(
+                f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-pro:generateContent?key={GEMINI_API_KEY}",
+                json=payload,
+                headers={"Content-Type": "application/json"},
+                timeout=20
+            )
 
-        buf = io.BytesIO()
-        bw_image.save(buf, format="PNG")
-        bw_bytes = buf.getvalue()
-        bw_base64 = base64.b64encode(bw_bytes).decode("utf-8")
+            print("Status Code of Gemini:", response.status_code)
 
-        return [ImageContent(type="image", mimeType="image/png", data=bw_base64)]
+            if response.status_code != 200:
+                raise Exception(f"Gemini API error: {response.status_code} - {response.text}")
+
+            result = response.json()
+            print("Response from Gemini:", result)
+
+            # Validate response structure
+            candidates = result.get("candidates")
+            if not candidates or len(candidates) == 0:
+                raise Exception("No candidates found in Gemini response")
+
+            content = candidates[0].get("content")
+            if not content:
+                raise Exception("No content found in Gemini response candidate")
+
+            parts = content.get("parts")
+            if not parts or len(parts) == 0:
+                # If 'parts' missing, fallback to raw text or whole content
+                fallback_text = content.get("text") or "general product search"
+                return fallback_text.strip()
+
+            return parts[0].get("text", "general product search").strip()
+
     except Exception as e:
-        raise McpError(ErrorData(code=INTERNAL_ERROR, message=str(e)))
+        print("Error in Gemini:", e)
+        return "general product search"
 
+async def search_products_serper(query: str, max_results: int = 5) -> list:
+    """
+    Search for products using Serper Shopping API
+    """
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "q": query,
+                "gl": "in",  # Country code
+                "hl": "en",  # Language
+                "num": max_results
+            }
+            
+            headers = {
+                "X-API-KEY": SERPER_API_KEY,
+                "Content-Type": "application/json"
+            }
+            
+            response = await client.post(
+                "https://google.serper.dev/shopping",
+                json=payload,
+                headers=headers,
+                timeout=30
+            )
+            
+            if response.status_code != 200:
+                raise Exception(f"Serper API error: {response.status_code} - {response.text}")
+            
+            data = response.json()
+            
+            products = []
+            shopping_results = data.get('shopping', [])
+            
+            for item in shopping_results[:max_results]:
+                product = {
+                    'title': item.get('title', 'Unknown Product'),
+                    'price': item.get('price', 'N/A'),
+                    'source': item.get('source', 'Unknown Store'),
+                    'link': item.get('link', '#'),
+                    'rating': item.get('rating'),
+                    'reviews': item.get('reviews')
+                }
+                products.append(product)
+            
+            return products
+            
+    except Exception as e:
+        raise Exception(f"Product search failed: {str(e)}")
+
+
+# Don't forget to add this to your environment variables:
+# SERPER_API_KEY = os.environ.get("SERPER_API_KEY")
+# assert SERPER_API_KEY is not None, "Please set SERPER_API_KEY in your .env file"
 # --- Run MCP Server ---
 async def main():
     print("🚀 Starting MCP server on http://0.0.0.0:8086")
