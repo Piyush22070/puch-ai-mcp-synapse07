@@ -124,7 +124,7 @@ class Fetch:
 
 # --- MCP Server Setup ---
 mcp = FastMCP(
-    "Job Finder MCP Server",
+    "Best product Links with an image",
     auth=SimpleBearerAuthProvider(TOKEN),
 )
 
