@@ -133,6 +133,10 @@ mcp = FastMCP(
 async def validate() -> str:
     return MY_NUMBER
 
+@mcp.tool
+async def about() -> dict:
+    return {"AlphaVision": mcp.name, "description": "This tool find exact products from the given image and return with shopping links "}
+
 
 # --- Tool: find_product_online (FIXED WITH ERROR HANDLING) ---
 # add the custom tool for product here
